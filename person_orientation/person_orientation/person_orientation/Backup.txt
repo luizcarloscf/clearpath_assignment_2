@@ -1,0 +1,183 @@
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import Image, LaserScan
+from std_msgs.msg import Float32, Bool
+from geometry_msgs.msg import Twist, PoseStamped
+import cv2
+import mediapipe as mp
+import math
+from cv_bridge import CvBridge
+import numpy as np
+from tf2_msgs.msg import TFMessage
+
+class PersonOrientationNode(Node):
+
+    def __init__(self):
+        super().__init__('person_orientation_node')
+        
+        # Inicializando o CvBridge
+        self.bridge = CvBridge()
+
+        # camera
+        self.image_subscriber = self.create_subscription(Image,'/a200_0000/sensors/camera_0/color/image',self.image_callback,10)  
+        self.lidar_subscriber = self.create_subscription(LaserScan,'/a200_0000/sensors/lidar2d_0/scan',self.lidar_callback,10)
+
+        #orientação da pessoa
+        self.orientation_publisher = self.create_publisher(Float32, '/person_orientation', 10)
+        self.cmd_vel_publisher = self.create_publisher(Twist, '/a200_0000/cmd_vel', 10) #alinhar com a pessoa
+        
+        self.explore_resume_publisher = self.create_publisher(Bool, '/a200_0000/explore/resume', 10)
+        self.goal_pose_publisher = self.create_publisher(PoseStamped, '/a200_0000/goal_pose', 10)
+
+        #MediaPipe
+        self.mp_pose = mp.solutions.pose
+        self.pose = self.mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)
+
+        self.goal_sent = False # Variáveis de controle
+        self.goal_pose_published = False
+        self.last_person_angle = None
+        self.obstacle_distance = None
+
+    def image_callback(self, msg):
+        try:
+            cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+            cv_image = cv2.flip(cv_image, 0)
+        except Exception as e:
+            self.get_logger().error(f"Erro ao converter a imagem: {e}")
+            return
+
+        image_rgb = cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGB)
+        results = self.pose.process(image_rgb)
+
+        if results.pose_landmarks:
+            shoulder_left = results.pose_landmarks.landmark[11]   # Ombro esquerdo
+            shoulder_right = results.pose_landmarks.landmark[12]  # Ombro direito
+            wrist_left = results.pose_landmarks.landmark[15]       # Pulso esquerdo
+            wrist_right = results.pose_landmarks.landmark[16]      # Pulso direito
+            
+            image_width, image_height = image_rgb.shape[1], image_rgb.shape[0] #Denormalizar para pixel
+            
+            shoulder_left_x = shoulder_left.x * image_width
+            shoulder_left_y = shoulder_left.y * image_height
+            shoulder_right_x = shoulder_right.x * image_width
+            shoulder_right_y = shoulder_right.y * image_height
+            wrist_left_x = wrist_left.x * image_width
+            wrist_left_y = wrist_left.y * image_height
+            wrist_right_x = wrist_right.x * image_width
+            wrist_right_y = wrist_right.y * image_height
+            
+            shoulder_center_x = (shoulder_left_x + shoulder_right_x) / 2 #centro dos ombros
+            wrist_avg_x = (wrist_left_x + wrist_right_x) / 2 #posição média dos pulsos
+            wrist_avg_y = (wrist_left_y + wrist_right_y) / 2
+
+            delta_x = wrist_avg_x - shoulder_center_x # Vetor (centro dos ombros até a média dos pulsos)
+            delta_y = wrist_avg_y - ((shoulder_left_y + shoulder_right_y) / 2)
+
+            angle_rad = math.atan2(delta_y, delta_x)
+            angle_deg = math.degrees(angle_rad)
+            
+            self.publish_orientation(angle_deg) #publica a orientação (em graus)
+            self.last_person_angle = angle_deg
+            
+            # posicao horizontal em relacao a imagem para centralizar
+            error_a = (image_width / 2) - shoulder_center_x  # error positivo-pessoa está à esquerda; negativo-direita. 
+            Kp = 0.5  
+            angular_z = Kp * error_a
+            erro_x = (self.obstacle_distance - 2)
+            linear_x = Kp * erro_x
+            self.get_logger().info(f"Comando cmd_vel angular_z: {angular_z:.2f} rad/s")
+            self.publish_cmd_vel(angular_z, linear_x)
+            
+            # Executa a sequência de parada de exploração e envio do goal pose (apenas uma vez)
+            if not self.goal_sent:  # Publicar comando para retomar exploração: False
+                bool_msg = Bool()
+                bool_msg.data = False
+                self.explore_resume_publisher.publish(bool_msg)
+                self.get_logger().info("Publicado /a200_0000/explore/resume com data: False")
+                
+                self.goal_sent = True
+                self.create_timer(5.0, self.publish_goal_pose) #timer para enviar a posicao
+                
+        else:
+            self.get_logger().info("Nenhuma pessoa detectada na imagem.")
+
+    def lidar_callback(self, msg): #usar manualmente os dados do lidar para saber a distancia até a pessoa
+        ranges = list(msg.ranges)
+        total_medidas = len(ranges)
+        indice_frente = total_medidas // 2  # Índice correspondente a 0°
+
+        largura_janela = 5  # Janela de medições
+        inicio = max(0, indice_frente - largura_janela)
+        fim = min(total_medidas, indice_frente + largura_janela + 1)  # +1 para incluir o último elemento
+
+        obstaculo_mais_proximo = min(ranges[inicio:fim])
+        self.obstacle_distance = obstaculo_mais_proximo
+        self.get_logger().info(f"Obstáculo mais próximo à frente: {obstaculo_mais_proximo:.2f} m")
+
+    def publish_orientation(self, angle):
+        # Publicar a orientação (em graus)
+        msg = Float32()
+        msg.data = angle
+        self.orientation_publisher.publish(msg)
+        self.get_logger().info(f"Orientação da pessoa publicada: {angle:.2f} graus")
+        
+    def publish_cmd_vel(self, angular_z, linear_x):
+        # Publicar o comando de velocidade (apenas angular em yaw)
+        twist_msg = Twist()
+        twist_msg.linear.x = linear_x  # Sem movimento linear
+        twist_msg.angular.z = -angular_z  # Sinal invertido se necessário ajustar a direção
+        self.cmd_vel_publisher.publish(twist_msg)
+    
+    def publish_goal_pose(self):
+        # Publicar o goal pose após 5 segundos (apenas se ainda não foi publicado)
+        if self.goal_pose_published:
+            return
+        if self.last_person_angle is None or self.obstacle_distance is None:
+            self.get_logger().warn("Dados insuficientes para publicar goal pose")
+            return
+        
+        self.goal_pose_published = True
+        psi = math.radians(self.last_person_angle)
+        d = self.obstacle_distance
+
+        r = np.array([np.sin(psi), np.cos(psi)],
+                     np.cos(psi),np.sin(psi))
+        
+        # Cálculo da posição desejada:
+        # goal = (posição do robô) + (d * [cos(theta), sin(theta)]) + (1m para a direita)
+        # Vetor unitário para a direita (no frame ROS, considerando x para frente e y para a esquerda): (sin(theta), -cos(theta))
+        goal_x = d * math.cos(theta) + 1 * math.sin(theta)
+        goal_y = d * math.sin(theta) - 1 * math.cos(theta)
+        
+        # Converter o ângulo (yaw) em quaternion (apenas rotação em z)
+        qz = math.sin(theta / 2.0)
+        qw = math.cos(theta / 2.0)
+        
+        goal_msg = PoseStamped()
+        goal_msg.header.stamp = self.get_clock().now().to_msg()
+        goal_msg.header.frame_id = "map"  # Ajuste conforme seu sistema de referência
+        goal_msg.pose.position.x = goal_x
+        goal_msg.pose.position.y = goal_y
+        goal_msg.pose.position.z = 0.0
+        goal_msg.pose.orientation.x = 0.0
+        goal_msg.pose.orientation.y = 0.0
+        goal_msg.pose.orientation.z = qz
+        goal_msg.pose.orientation.w = qw
+        
+        self.goal_pose_publisher.publish(goal_msg)
+        self.get_logger().info(f"Goal pose publicado: x={goal_x:.2f}, y={goal_y:.2f}, yaw={self.last_person_angle:.2f}°")
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = PersonOrientationNode()
+    
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()

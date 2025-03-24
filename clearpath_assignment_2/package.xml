@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>clearpath_assignment_2</name>
+  <version>2.0.0</version>
+  <description>Assignment 2 for Clearpath robots</description>
+  <maintainer email="luiz.cosmi@edu.ufes.br">Luiz Carlos Cosmi Filho</maintainer>
+
+  <license>BSD</license>
+
+  <author email="luiz.cosmi@edu.ufes.br">Luiz Carlos Cosmi Filho</author>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <exec_depend>clearpath_config</exec_depend>
+  <exec_depend>nav2_bringup</exec_depend>
+  <exec_depend>slam_toolbox</exec_depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
