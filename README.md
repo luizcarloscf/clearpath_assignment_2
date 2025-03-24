@@ -1,4 +1,4 @@
-# Assignment 1
+# Assignment 2
 
 This repository includes a solution for the second assignment of a course presented in the [Electrical Engineering] department at the [UFES], by [PhD Ricardo Carminati de Mello] using ROS. 
 
